@@ -1,10 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
-    time::Instant,
 };
 
 use tokio::sync::Mutex;
@@ -19,6 +18,7 @@ pub struct CursorToolRuntime {
     execs: Arc<Mutex<HashMap<u32, PendingExec>>>,
     interactions: Arc<Mutex<HashMap<u32, PendingInteraction>>>,
     completed: Arc<Mutex<HashMap<u32, String>>>,
+    interrupted: Arc<Mutex<HashSet<u32>>>,
 }
 
 pub(crate) struct PendingExec {
@@ -35,14 +35,6 @@ pub(crate) enum ExecStage {
     DynamicMcp(pb::McpToolDefinition),
     EditRead,
     EditWrite(EditWrite),
-    Await(AwaitState),
-}
-
-pub(crate) struct AwaitState {
-    pub deadline: Instant,
-    pub output_file_path: String,
-    pub task_id: String,
-    pub regex: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -171,60 +163,6 @@ impl CursorToolRuntime {
         .await
     }
 
-    pub(crate) async fn reserve_await(
-        &self,
-        call: &ToolCall,
-        context: &ExecContext,
-    ) -> Result<u32> {
-        let task_id = call
-            .arguments
-            .get("shell_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::Protocol("AwaitShell is missing shell_id".into()))?;
-        let block_ms = call
-            .arguments
-            .get("block_until_ms")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(30_000);
-        if block_ms > 7_140_000 {
-            return Err(Error::Protocol(
-                "AwaitShell block_until_ms exceeds 7140000".into(),
-            ));
-        }
-        let output_file_path = format!(
-            "{}/{}.txt",
-            context.terminals_folder.trim_end_matches('/'),
-            task_id
-        );
-        self.reserve_exec_stage(
-            call,
-            context,
-            ExecStage::Await(AwaitState {
-                deadline: Instant::now() + std::time::Duration::from_millis(block_ms),
-                output_file_path,
-                task_id: task_id.to_string(),
-                regex: call
-                    .arguments
-                    .get("pattern")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-            }),
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn reserve_await_again(
-        &self,
-        call: &ToolCall,
-        context: &ExecContext,
-        state: AwaitState,
-        started_at_ms: u64,
-    ) -> Result<u32> {
-        self.reserve_exec_stage(call, context, ExecStage::Await(state), Some(started_at_ms))
-            .await
-    }
-
     async fn reserve_exec_stage(
         &self,
         call: &ToolCall,
@@ -311,6 +249,10 @@ impl CursorToolRuntime {
         self.completed.lock().await.get(&id).cloned()
     }
 
+    pub async fn is_interrupted(&self, id: u32) -> bool {
+        self.interrupted.lock().await.contains(&id)
+    }
+
     pub async fn clear_completed(&self) {
         self.completed.lock().await.clear();
     }
@@ -329,7 +271,37 @@ impl CursorToolRuntime {
         ids.sort_unstable();
         self.interactions.lock().await.clear();
         self.completed.lock().await.clear();
+        self.interrupted.lock().await.clear();
         ids
+    }
+
+    pub async fn interrupt_for_message(&self) -> Vec<u32> {
+        let (abort_ids, interrupted_ids) = {
+            let mut entries = self.execs.lock().await;
+            let mut abort_ids = Vec::new();
+            let mut interrupted_ids = Vec::new();
+            entries.retain(|id, entry| {
+                interrupted_ids.push(*id);
+                let keep_running = entry.call.name.eq_ignore_ascii_case("Task");
+                if !keep_running {
+                    abort_ids.push(*id);
+                }
+                keep_running
+            });
+            (abort_ids, interrupted_ids)
+        };
+        let interaction_ids = {
+            let mut interactions = self.interactions.lock().await;
+            let ids = interactions.keys().copied().collect::<Vec<_>>();
+            interactions.clear();
+            ids
+        };
+        let mut interrupted = self.interrupted.lock().await;
+        interrupted.extend(interrupted_ids);
+        interrupted.extend(interaction_ids);
+        let mut abort_ids = abort_ids;
+        abort_ids.sort_unstable();
+        abort_ids
     }
 
     pub async fn running_exec_ids(&self) -> Vec<u32> {

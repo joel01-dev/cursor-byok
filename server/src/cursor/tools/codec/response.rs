@@ -12,7 +12,7 @@ use crate::{
     Error, Result,
 };
 
-use super::request::{await_read_request, edit_write_request};
+use super::request::edit_write_request;
 
 pub enum ClientExecEvent {
     Delta(Box<pb::AgentServerMessage>),
@@ -25,6 +25,12 @@ pub async fn client_event(
     message: &pb::ExecClientMessage,
     pending: &CursorToolRuntime,
 ) -> Result<ClientExecEvent> {
+    if pending.is_interrupted(message.id).await {
+        if message.message.as_ref().is_some_and(is_terminal) {
+            pending.discard_exec(message.id).await;
+        }
+        return Ok(ClientExecEvent::Pending);
+    }
     let call = match pending.exec_call(message.id).await {
         Some(call) => call,
         None if pending.completed_call(message.id).await.is_some() => {
@@ -47,7 +53,6 @@ pub async fn client_event(
         let entry = take(message.id, pending).await?;
         return match entry.stage {
             ExecStage::EditRead => advance_edit(entry, wire_result, pending).await,
-            ExecStage::Await(_) => advance_await(entry, wire_result, pending).await,
             ExecStage::Direct | ExecStage::DynamicMcp(_) | ExecStage::EditWrite(_) => {
                 completed(entry, wire_result.clone())
             }
@@ -131,6 +136,10 @@ pub async fn client_event(
 }
 
 pub async fn stream_closed(id: u32, pending: &CursorToolRuntime) -> Result<Option<ToolCompletion>> {
+    if pending.is_interrupted(id).await {
+        pending.discard_exec(id).await;
+        return Ok(None);
+    }
     let Some(entry) = pending.take_exec(id).await else {
         return Ok(None);
     };
@@ -177,79 +186,20 @@ pub async fn stream_closed(id: u32, pending: &CursorToolRuntime) -> Result<Optio
     )?))
 }
 
-async fn advance_await(
-    entry: PendingExec,
-    result: &pb::exec_client_message::Message,
-    registry: &CursorToolRuntime,
-) -> Result<ClientExecEvent> {
-    let read = match result {
-        pb::exec_client_message::Message::ReadResult(result)
-        | pb::exec_client_message::Message::RedactedReadResult(result) => result,
-        _ => return Err(Error::Protocol("AwaitShell expected ReadResult".into())),
-    };
-    let ExecStage::Await(state) = &entry.stage else {
-        return Err(Error::Protocol(
-            "AwaitShell result reached a non-await execution stage".into(),
-        ));
-    };
-    let content = match read.result.as_ref() {
-        Some(pb::read_result::Result::Success(success)) => match success.output.as_ref() {
-            Some(pb::read_success::Output::Content(content)) => content.as_str(),
-            _ => "",
-        },
-        Some(pb::read_result::Result::FileNotFound(_)) => "",
-        Some(pb::read_result::Result::Error(error)) => {
-            return Ok(ClientExecEvent::Completed(Box::new(result::await_error(
-                entry,
-                &error.error,
-            )?)))
-        }
-        _ => "",
-    };
-    let regex_match = state
-        .regex
-        .as_ref()
-        .map(|pattern| regex::Regex::new(pattern))
-        .transpose()
-        .map_err(|error| Error::Protocol(format!("invalid AwaitShell pattern: {error}")))?
-        .and_then(|pattern| {
-            pattern
-                .find(content)
-                .map(|found| found.as_str().to_string())
-        });
-    let exit_code = content.lines().find_map(|line| {
-        line.strip_prefix("exit_code:")
-            .and_then(|value| value.trim().parse::<i32>().ok())
-    });
-    if regex_match.is_some() || exit_code.is_some() || std::time::Instant::now() >= state.deadline {
-        return Ok(ClientExecEvent::Completed(Box::new(result::await_result(
-            entry,
-            content.len() as u64,
-            regex_match,
-            exit_code,
-        )?)));
+fn is_terminal(message: &pb::exec_client_message::Message) -> bool {
+    use pb::{exec_client_message::Message, shell_stream::Event};
+
+    match message {
+        Message::ShellStream(stream) => matches!(
+            stream.event.as_ref(),
+            Some(Event::Exit(_))
+                | Some(Event::Backgrounded(_))
+                | Some(Event::Rejected(_))
+                | Some(Event::PermissionDenied(_))
+                | Some(Event::SandboxUnsupported(_))
+        ),
+        _ => true,
     }
-    let state = match entry.stage {
-        ExecStage::Await(state) => state,
-        _ => {
-            return Err(Error::Protocol(
-                "AwaitShell result changed execution stage".into(),
-            ))
-        }
-    };
-    let wait = state
-        .deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .min(std::time::Duration::from_secs(1));
-    tokio::time::sleep(wait).await;
-    let call = entry.call.clone();
-    let context = entry.context.clone();
-    let id = registry
-        .reserve_await_again(&call, &context, state, entry.started_at_ms)
-        .await?;
-    Ok(ClientExecEvent::Message(Box::new(await_read_request(
-        id, &call, &context,
-    )?)))
 }
 
 async fn advance_edit(

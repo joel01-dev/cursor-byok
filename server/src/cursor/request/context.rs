@@ -505,6 +505,11 @@ fn normalize_mcp_parameters(tool_name: &str, mut parameters: Value) -> Result<Va
     if !object_only_union {
         return Err(invalid_mcp_parameters(tool_name));
     }
+    // OpenAI-compatible function schemas (and the corresponding schema
+    // validators used by other providers) require the root schema to declare
+    // an object type. Cursor's app-control MCP sometimes sends an object-only
+    // `anyOf`/`oneOf` schema without that root annotation. Preserve the union
+    // while adding the annotation to the model-facing copy.
     schema.insert("type".into(), Value::String("object".into()));
     Ok(parameters)
 }
