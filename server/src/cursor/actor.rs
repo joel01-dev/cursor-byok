@@ -8,6 +8,7 @@ use crate::{
         blob_sync::BlobSynchronizer,
         checkpoint::CheckpointBuilder,
         context_sync::RequestContextSynchronizer,
+        lifecycle,
         proto::agent::v1 as pb,
         request,
         session::CursorSession,
@@ -58,13 +59,14 @@ impl CursorActor {
                 let command = match receiver.recv().await {
                     Some(command) => command,
                     None => {
-                        handle.cancel();
+                        lifecycle::cancel(&handle).ok();
                         break;
                     }
                 };
                 match command {
                     CursorCommand::Abort => {
-                        handle.cancel();
+                        lifecycle::cancel(&handle).ok();
+                        break;
                     }
                     CursorCommand::Finished => {
                         break;
@@ -283,10 +285,6 @@ impl CursorActor {
                                                     )
                                                     .await
                                                 {
-                                                    continue;
-                                                }
-                                                if tool_runtime.is_interrupted(throw.id).await {
-                                                    tool_runtime.discard_exec(throw.id).await;
                                                     continue;
                                                 }
                                                 match tool_runtime.take_exec(throw.id).await {
