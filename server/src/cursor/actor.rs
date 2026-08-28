@@ -65,8 +65,8 @@ impl CursorActor {
                 };
                 match command {
                     CursorCommand::Abort => {
+                        handle.mark_conversation_cancelled();
                         lifecycle::cancel(&handle).ok();
-                        break;
                     }
                     CursorCommand::Finished => {
                         break;
